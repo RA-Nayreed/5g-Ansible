@@ -132,6 +132,14 @@
       .namespace = "{{ ran_ns }}"
     ' "{{ values_file }}"
 
+- name: Pin N300 UHD management and primary data address to the R2Lab reference
+  ansible.builtin.shell: >
+    {{ yq_bin_path }} eval -i '
+      .gnbConfig.ru_sdr.device_args =
+      "mgmt_addr=192.168.235.103,addr=192.168.235.103,name=ni-n3xx-31D98C7,product=n300,num_recv_frames=32,num_send_frames=32,recv_frame_size=8000,send_frame_size=8000,master_clock_rate=122.88e6"
+    ' "{{ values_file }}"
+  when: rru == 'n300'
+
 - name: Fix device_args for rfsim GNU Radio single-channel multi-UE
   ansible.builtin.shell: >
     {{ yq_bin_path }} eval -i '
