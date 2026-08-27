@@ -49,23 +49,21 @@
         gnb_startup_success: false
         max_attempts: 2
 
-    - name: Deploy and Monitor srsRAN gNB
-      block:
-        - name: "Attempt gNB deployment (Attempt {{ item }})"
-          include_tasks: deploy_with_check.yml
-          loop: "{{ range(1, max_attempts + 1) | list }}"
-          when: not gnb_startup_success
+    - name: Deploy and monitor srsRAN gNB
+      ansible.builtin.include_tasks: deploy_with_check.yml
+      loop: "{{ range(1, max_attempts + 1) | list }}"
+      when: not gnb_startup_success
 
-      rescue:
-        - name: Final failure message
-          ansible.builtin.fail:
-            msg: "gNB failed to start properly on both IP addresses."
-          when: not gnb_startup_success
+    - name: Fail after exhausted physical gNB attempts
+      ansible.builtin.fail:
+        msg: >-
+          Physical srsRAN gNB did not remain radio-ready after
+          {{ max_attempts }} deployment attempts.
+      when: not gnb_startup_success
 
     - name: Confirm success
       ansible.builtin.debug:
         msg: "srsRAN gNB is running successfully!"
-      when: gnb_startup_success
 
 - name: Configure SR-IOV for Benetel with DPDK
   when: rru in ['benetel1', 'benetel2']
@@ -214,4 +212,3 @@
   when:
     - rru in ['benetel1', 'benetel2']
     - venv_python.stat.exists | default(false)
-
