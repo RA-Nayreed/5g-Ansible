@@ -5,6 +5,13 @@
     path: "{{ yq_bin_path }}"
   register: yq_bin
 
+- name: Refuse missing yq when live installs are disabled
+  ansible.builtin.fail:
+    msg: "yq is required at {{ yq_bin_path }} and live installs are disabled"
+  when:
+    - not yq_bin.stat.exists
+    - not (fiveg_allow_live_installs | default(true) | bool)
+
 - name: Download yq binary using curl or wget
   ansible.builtin.shell: |
     set -e
@@ -18,7 +25,9 @@
     fi
   args:
     creates: "{{ yq_bin_path }}"
-  when: not yq_bin.stat.exists
+  when:
+    - not yq_bin.stat.exists
+    - fiveg_allow_live_installs | default(true) | bool
   become: true
 
 - name: Ensure yq is executable
@@ -37,23 +46,38 @@
     file: "{{ fiveg_profile_file }}"
     name: fiveg
 
+- name: Resolve selected slices
+  ansible.builtin.set_fact:
+    fiveg_effective_slices: >-
+      {{ fiveg.slices
+         if (fiveg_selected_slices | default([]) | length == 0)
+         else (fiveg.slices | selectattr('name', 'in', fiveg_selected_slices) | list) }}
+
+- name: Fail if a requested slice is absent from the profile
+  ansible.builtin.assert:
+    that:
+      - (fiveg_effective_slices | map(attribute='name') | list | sort) == (fiveg_selected_slices | sort)
+    fail_msg: "one or more fiveg_selected_slices are absent from the active profile"
+  when: fiveg_selected_slices | default([]) | length > 0
+
 - name: Show active 5G profile
   debug:
     msg:
       - "Using 5G profile: {{ fiveg_profile | default('default') }}"
       - "PLMN: {{ fiveg.plmn.mcc }}{{ fiveg.plmn.mnc }}"
       - "TAC: {{ fiveg.plmn.tac }}"
+      - "Slices: {{ fiveg_effective_slices | map(attribute='name') | list }}"
 
 - name: Initialize gnb_slices and amf_slices
   set_fact:
     gnb_slices: []
     amf_slices: []
 
-- name: Map slices strictly for gNB and AMF
+- name: Map selected slices strictly for gNB and AMF
   set_fact:
     gnb_slices: "{{ (gnb_slices | default([])) + [ slice_entry ] }}"
     amf_slices: "{{ (amf_slices | default([])) + [ slice_entry ] }}"
-  loop: "{{ fiveg.slices }}"
+  loop: "{{ fiveg_effective_slices }}"
   loop_control:
     loop_var: sl_item
   vars:

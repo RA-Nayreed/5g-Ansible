@@ -1,0 +1,17 @@
+---
+- name: Clean selected R2Lab resources
+  hosts: faraday
+  gather_facts: false
+  roles:
+    - role: r2lab/cleanup
+      when: rru | default('rfsim') != 'rfsim'
+
+- name: Remove explicitly owned Kubernetes namespaces
+  hosts: core_node
+  gather_facts: false
+  tasks:
+    - name: Delete explicitly selected deployment namespace
+      ansible.builtin.command: >-
+        kubectl delete namespace {{ item }} --ignore-not-found=true
+      loop: "{{ fiveg_cleanup_namespaces | default([]) }}"
+      changed_when: true

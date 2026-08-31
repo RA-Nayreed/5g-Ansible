@@ -7,12 +7,41 @@
     update: yes
     force: yes
 
-# Then apply the 5G profile settings on the repo
-
 - name: Load active 5G profile
   ansible.builtin.include_vars:
     file: "{{ playbook_dir }}/../group_vars/all/5g_profile_{{ fiveg_profile | default('default') }}.yaml"
     name: fiveg
+
+- name: Resolve effective Open5GS slices
+  ansible.builtin.set_fact:
+    fiveg_effective_slices: >-
+      {{ fiveg.slices
+         if (fiveg_selected_slices | default([]) | length == 0)
+         else (fiveg.slices | selectattr('name', 'in', fiveg_selected_slices) | list) }}
+
+- name: Initialize effective Open5GS UE map
+  ansible.builtin.set_fact:
+    fiveg_effective_ues: {}
+
+- name: Resolve effective Open5GS UEs
+  ansible.builtin.set_fact:
+    fiveg_effective_ues: "{{ fiveg_effective_ues | combine({item.key: item.value}) }}"
+  loop: "{{ fiveg.ues | dict2items }}"
+  when: fiveg_selected_ues | default([]) | length == 0 or item.key in fiveg_selected_ues
+
+- name: Validate requested slice selection
+  ansible.builtin.assert:
+    that:
+      - (fiveg_effective_slices | map(attribute='name') | list | sort) == (fiveg_selected_slices | sort)
+    fail_msg: "one or more fiveg_selected_slices are absent from the active profile"
+  when: fiveg_selected_slices | default([]) | length > 0
+
+- name: Validate requested UE selection
+  ansible.builtin.assert:
+    that:
+      - (fiveg_effective_ues.keys() | list | sort) == (fiveg_selected_ues | sort)
+    fail_msg: "one or more fiveg_selected_ues are absent from the active profile"
+  when: fiveg_selected_ues | default([]) | length > 0
 
 - name: Validate PLMN
   assert:
@@ -27,15 +56,15 @@
       - slice.name is defined
       - slice.sst is defined
       - slice.dnn is defined
-  loop: "{{ fiveg.slices }}"
+  loop: "{{ fiveg_effective_slices }}"
   loop_control:
     loop_var: slice
 
 - name: Validate UE slice references
   assert:
     that:
-      - ue.value.slice in fiveg.slices | map(attribute='name') | list
-  loop: "{{ fiveg.ues | dict2items }}"
+      - ue.value.slice in fiveg_effective_slices | map(attribute='name') | list
+  loop: "{{ fiveg_effective_ues | dict2items }}"
   loop_control:
     loop_var: ue
 
@@ -97,4 +126,3 @@
     dest: /root/open5gs_profile_check.txt
     owner: root
     mode: '0644'
-

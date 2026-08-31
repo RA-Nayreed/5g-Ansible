@@ -1,5 +1,28 @@
 # automatically loaded by ansible
 
-# Active profile, can be overloaded via -e
+# Active profile, can be overridden via -e.
 fiveg_profile: default
 
+# Machine/deployment policy. Defaults preserve the historical interactive behavior.
+fiveg_deployment_id: ""
+fiveg_prepare_only: false
+fiveg_allow_live_installs: true
+fiveg_manage_os_dependencies: true
+fiveg_manage_python_dependencies: true
+fiveg_disruptive_cluster_ops_enabled: true
+fiveg_k8s_env_enabled: true
+fiveg_python_interpreter: ""
+fiveg_selected_slices: []
+fiveg_selected_ues: []
+fiveg_cleanup_namespaces: []
+
+# Optional components.
+open5gs_webui_enabled: true
+open5gs_admin_account_enabled: true
+
+# Provider/resource authority. Disable only when an external controller already owns POS allocation.
+pos_manage_allocation: true
+
+# R2Lab transport policy. The machine interface defaults to strict checking.
+r2lab_strict_host_key_checking: false
+r2lab_known_hosts_file: ""

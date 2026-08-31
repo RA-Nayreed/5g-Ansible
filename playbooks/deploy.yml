@@ -1,12 +1,9 @@
 ---
 - hosts: webshell
   gather_facts: false
-
   vars:
     original_inventory: "{{ inventory_file }}"
-
   tasks:
-
     - name: Show used inventory
       debug:
         msg: "Used inventory for run_pos playbook : {{ original_inventory }}"
@@ -16,7 +13,7 @@
         ansible-playbook
         -i {{ inventory_file }}
         playbooks/run_pos.yml
-        --extra-vars "node={{ item }} no_boot={{ no_boot | default(false) }}"
+        --extra-vars "node={{ item }} no_boot={{ no_boot | default(false) }} pos_manage_allocation={{ pos_manage_allocation | default(true) }}"
         -c local
       args:
         chdir: "{{ playbook_dir | dirname }}"
@@ -39,7 +36,6 @@
           loop: "{{ async_jobs.results }}"
           loop_control:
             label: "{{ item.item }}"
-
         - name: Show live job status
           debug:
             msg: |
@@ -78,8 +74,6 @@
       when: item.rc != 0
       loop: "{{ job_status.results }}"
 
-# The following task requires all nodes be ssh-reachable
-# so it can't be the first task of the playbook
 - hosts: localhost,sopnodes
   gather_facts: true
   tasks:
@@ -95,9 +89,9 @@
     - role: setup/pre_k8s
     - role: setup/k8s/k8s_setup
     - role: setup/k8s/k8s_env
+      when: fiveg_k8s_env_enabled | default(true) | bool
     - role: setup/optimization/cpu
     - role: setup/ovs
-      #when: bridge_enabled
 
 - name: PTP setup on ran_node
   hosts: ran_node
@@ -118,7 +112,6 @@
 - name: Debug type of bridge_enabled on RAN node
   hosts: ran_node
   become: true
-
   tasks:
     - name: Show bridge_enabled and ran_node_name
       debug:
@@ -127,7 +120,7 @@
           - "type = {{ bridge_enabled | default(None) | type_debug }}"
           - "ran_node_name value = {{ ran_node_name | default('UNDEFINED') }}"
 
-- name: Remove Control-Plane NoSchedule taint on CORE node  
+- name: Remove Control-Plane NoSchedule taint on CORE node
   hosts: core_node
   become: true
   roles:
@@ -140,7 +133,7 @@
     - role: setup/k8s/cluster_join
       when: inventory_hostname != core_node_name
 
-- name: Add NoSchedule taint on RAN node (reserved node for RAN pods)
+- name: Add NoSchedule taint on RAN node
   hosts: core_node
   become: true
   roles:
@@ -174,16 +167,21 @@
         name: monarch/deploy
       vars:
         branch: srsRAN_metrics
-      when: monitoring_enabled and ran == 'srsRAN'
-
+      when:
+        - not (fiveg_prepare_only | default(false) | bool)
+        - monitoring_enabled
+        - ran == 'srsRAN'
     - name: Deploy Monarch for OAI
       include_role:
         name: monarch/deploy
       vars:
         branch: with_data_persistance_for_sopnodes
-      when: monitoring_enabled and ran == 'oai'
+      when:
+        - not (fiveg_prepare_only | default(false) | bool)
+        - monitoring_enabled
+        - ran == 'oai'
 
-- name: Add NoSchedule taint on Monitor node (core/ran pods should not run on monitor_node)
+- name: Add NoSchedule taint on Monitor node
   hosts: core_node
   become: true
   roles:
@@ -220,11 +218,12 @@
     - name: Load 5G profile
       include_vars:
         file: "{{ playbook_dir }}/../group_vars/all/5g_profile_{{ fiveg_profile | default('default') }}.yaml"
+      when: not (fiveg_prepare_only | default(false) | bool)
   roles:
     - role: 5g/open5gs/config
-      when: core == 'open5gs'
+      when: core == 'open5gs' and not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/open5gs/deploy
-      when: core == 'open5gs'
+      when: core == 'open5gs' and not (fiveg_prepare_only | default(false) | bool)
 
 - name: Deploy Free5gc
   hosts: core_node
@@ -232,26 +231,21 @@
     - name: Load 5G profile
       include_vars:
         file: "{{ playbook_dir }}/../group_vars/all/5g_profile_{{ fiveg_profile | default('default') }}.yaml"
+      when: not (fiveg_prepare_only | default(false) | bool)
   roles:
     - role: 5g/free5gc/node
-      when: core == 'free5gc'
+      when: core == 'free5gc' and not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/free5gc/config
-      when: core == 'free5gc'
+      when: core == 'free5gc' and not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/free5gc/deploy
-      when: core == 'free5gc'
+      when: core == 'free5gc' and not (fiveg_prepare_only | default(false) | bool)
 
-############################################################################
-# Move this block where you want to restart with start-at-task=RESTART_HERE"
-#
 - hosts: localhost,core_node,ran_node
   gather_facts: false
   tasks:
     - name: RESTART_HERE
       ansible.builtin.meta: noop
-
     - import_tasks: ../tasks/reload_booleans.yml
-#
-############################################################################
 
 - name: Deploy OAI CN/RAN
   hosts: ran_node
@@ -259,17 +253,18 @@
     - name: Load 5G profile
       include_vars:
         file: "{{ playbook_dir }}/../group_vars/all/5g_profile_{{ fiveg_profile | default('default') }}.yaml"
+      when: not (fiveg_prepare_only | default(false) | bool)
   roles:
     - role: 5g/oai/config
-      when: core == 'oai' or ran == 'oai'
+      when: (core == 'oai' or ran == 'oai') and not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/oai/setup
-      when: core == 'oai' or ran == 'oai'
+      when: (core == 'oai' or ran == 'oai') and not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/oai/core
-      when: core == 'oai'
+      when: core == 'oai' and not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/oai/ran
-      when: ran == 'oai'
+      when: ran == 'oai' and not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/oai/csi_logging
-      when: ran == 'oai' and oai_csi_logging_enabled | default(false)
+      when: ran == 'oai' and oai_csi_logging_enabled | default(false) and not (fiveg_prepare_only | default(false) | bool)
 
 - name: Deploy srsRAN
   hosts: ran_node
@@ -279,51 +274,57 @@
     - name: Load 5G profile
       include_vars:
         file: "{{ playbook_dir }}/../group_vars/all/5g_profile_{{ fiveg_profile | default('default') }}.yaml"
+      when: not (fiveg_prepare_only | default(false) | bool)
   roles:
     - role: 5g/srsRAN/config
-      when: ran == 'srsRAN'
+      when: ran == 'srsRAN' and not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/srsRAN/deploy
-      when: ran == 'srsRAN'
+      when: ran == 'srsRAN' and not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/srsRAN/csi
-      when: 
+      when:
         - ran == 'srsRAN'
         - csi_logger_enabled | default(false)
+        - not (fiveg_prepare_only | default(false) | bool)
 
 - name: Deploy ueransim for oai core
   hosts: ran_node
-
   pre_tasks:
     - name: Load 5G profile
       include_vars:
         file: "{{ playbook_dir }}/../group_vars/all/5g_profile_{{ fiveg_profile | default('default') }}.yaml"
         name: fiveg
+      when: not (fiveg_prepare_only | default(false) | bool)
   roles:
     - role: 5g/ueransim/config
       when:
         - ran == 'ueransim'
         - core == 'oai'
+        - not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/ueransim/deploy
       when:
         - ran == 'ueransim'
         - core == 'oai'
+        - not (fiveg_prepare_only | default(false) | bool)
 
 - name: Deploy ueransim for other 5G cores than oai
   hosts: core_node
-
   pre_tasks:
     - name: Load 5G profile
       include_vars:
         file: "{{ playbook_dir }}/../group_vars/all/5g_profile_{{ fiveg_profile | default('default') }}.yaml"
         name: fiveg
+      when: not (fiveg_prepare_only | default(false) | bool)
   roles:
     - role: 5g/ueransim/config
       when:
         - ran == 'ueransim'
         - core != 'oai'
+        - not (fiveg_prepare_only | default(false) | bool)
     - role: 5g/ueransim/deploy
       when:
         - ran == 'ueransim'
         - core != 'oai'
+        - not (fiveg_prepare_only | default(false) | bool)
 
 - name: Remove NoSchedule taint on Monitor node
   hosts: core_node
@@ -342,9 +343,14 @@
         name: monarch/monitoring
       vars:
         set_gnb_monitoring: false
-      when: monitoring_enabled and ran == 'oai'
-
+      when:
+        - not (fiveg_prepare_only | default(false) | bool)
+        - monitoring_enabled
+        - ran == 'oai'
     - name: Launch monitoring for srsRAN
       include_role:
         name: monarch/monitoring
-      when: monitoring_enabled and ran == 'srsRAN'
+      when:
+        - not (fiveg_prepare_only | default(false) | bool)
+        - monitoring_enabled
+        - ran == 'srsRAN'
