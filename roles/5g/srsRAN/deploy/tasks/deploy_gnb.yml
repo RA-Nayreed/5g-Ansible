@@ -3,13 +3,23 @@
   ansible.builtin.stat:
     path: /opt/ansible-venv/bin/python
   register: venv_python
-  when: rru in ['benetel1', 'benetel2']
+  when:
+    - rru in ['benetel1', 'benetel2']
+    - fiveg_python_interpreter | default('') | length == 0
+
+- name: Use explicitly prepared Python interpreter
+  ansible.builtin.set_fact:
+    ansible_python_interpreter: "{{ fiveg_python_interpreter }}"
+  when:
+    - rru in ['benetel1', 'benetel2']
+    - fiveg_python_interpreter | default('') | length > 0
 
 - name: Force Ansible to use venv Python
   ansible.builtin.set_fact:
     ansible_python_interpreter: /opt/ansible-venv/bin/python
   when:
     - rru in ['benetel1', 'benetel2']
+    - fiveg_python_interpreter | default('') | length == 0
     - venv_python.stat.exists | default(false)
 
 - name: Check if helm exists
@@ -18,11 +28,20 @@
   changed_when: false
   failed_when: false
 
+- name: Refuse missing Helm when live installs are disabled
+  ansible.builtin.fail:
+    msg: "Helm v3 is required and live installs are disabled"
+  when:
+    - helm_check.rc != 0
+    - not (fiveg_allow_live_installs | default(true) | bool)
+
 - name: Install Helm if missing
   ansible.builtin.shell: |
     set -e
     curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-  when: helm_check.rc != 0
+  when:
+    - helm_check.rc != 0
+    - fiveg_allow_live_installs | default(true) | bool
   args:
     executable: /bin/bash
 
@@ -43,29 +62,26 @@
 - name: Deploy srsRAN gNB (only when not rfsim)
   when: rru in ['n300', 'n320']
   block:
-
     - name: Set initial retry facts
       ansible.builtin.set_fact:
         gnb_startup_success: false
         max_attempts: 2
 
-    - name: Deploy and Monitor srsRAN gNB
-      block:
-        - name: "Attempt gNB deployment (Attempt {{ item }})"
-          include_tasks: deploy_with_check.yml
-          loop: "{{ range(1, max_attempts + 1) | list }}"
-          when: not gnb_startup_success
+    - name: Deploy and monitor srsRAN gNB
+      ansible.builtin.include_tasks: deploy_with_check.yml
+      loop: "{{ range(1, max_attempts + 1) | list }}"
+      when: not gnb_startup_success
 
-      rescue:
-        - name: Final failure message
-          ansible.builtin.fail:
-            msg: "gNB failed to start properly on both IP addresses."
-          when: not gnb_startup_success
+    - name: Fail after exhausted physical gNB attempts
+      ansible.builtin.fail:
+        msg: >-
+          Physical srsRAN gNB did not remain radio-ready after
+          {{ max_attempts }} deployment attempts.
+      when: not gnb_startup_success
 
     - name: Confirm success
       ansible.builtin.debug:
         msg: "srsRAN gNB is running successfully!"
-      when: gnb_startup_success
 
 - name: Configure SR-IOV for Benetel with DPDK
   when: rru in ['benetel1', 'benetel2']
@@ -75,7 +91,7 @@
         file: "{{ playbook_dir }}/../group_vars/ran_node.yml"
         name: ran_vars
 
-    - name: "Verify sriov_nnp_create has already created policies"
+    - name: Verify sriov_nnp_create has already created policies
       kubernetes.core.k8s_info:
         api_version: sriovnetwork.openshift.io/v1
         kind: SriovNetworkNodePolicy
@@ -84,32 +100,32 @@
       register: cplane_policy
       failed_when: cplane_policy.resources | length == 0
 
-    - name: "Detect FIRST VF (VF 0) from ruvfioc policy"
+    - name: Detect FIRST VF (VF 0) from ruvfioc policy
       shell: |
         lspci | grep "Virtual Function" | grep "3a:09" | head -1 | awk '{print $1}'
       register: vf_detect
       changed_when: false
       failed_when: vf_detect.stdout == ""
 
-    - name: "Update Helm: sriovResourceName to use C-plane resource"
+    - name: Update Helm sriovResourceName to use C-plane resource
       ansible.builtin.lineinfile:
         path: "{{ values_file }}"
         regexp: '^\s*sriovResourceName:'
         line: '  sriovResourceName: "{{ ran_vars.sriovResourceNameCplane }}"'
 
-    - name: "Update Helm: pciAddress with detected VF"
+    - name: Update Helm pciAddress with detected VF
       ansible.builtin.lineinfile:
         path: "{{ values_file }}"
         regexp: '^\s*pciAddress:'
         line: '  pciAddress: "0000:{{ vf_detect.stdout }}"'
 
-    - name: "Update srsRAN config: eal_args with detected VF"
+    - name: Update srsRAN config eal_args with detected VF
       ansible.builtin.lineinfile:
         path: "{{ values_file }}"
         regexp: 'eal_args:.*-a 0000:3a:09\.[0-9]'
         line: '    eal_args: "-l 6,7,8,9,10,11 --main-lcore 6 --force-max-simd-bitwidth 64 -a 0000:{{ vf_detect.stdout }}"'
 
-    - name: "Update srsRAN config: network_interface with detected VF"
+    - name: Update srsRAN config network_interface with detected VF
       ansible.builtin.lineinfile:
         path: "{{ values_file }}"
         regexp: '^\s*-\s*network_interface:'
@@ -118,7 +134,6 @@
 - name: Set CPU scaling governor to performance on ran node
   when: rru in ['benetel1', 'benetel2']
   block:
-
     - name: Set performance governor via pod
       kubernetes.core.k8s:
         state: present
@@ -143,14 +158,11 @@
                   - |
                     echo "Before:"
                     cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
-
                     for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
                       echo performance > $cpu 2>/dev/null || true
                     done
-
                     echo "After:"
                     cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
-
                     echo "Done"
                 volumeMounts:
                   - mountPath: /sys
@@ -213,5 +225,5 @@
     ansible_python_interpreter: /usr/bin/python3
   when:
     - rru in ['benetel1', 'benetel2']
+    - fiveg_python_interpreter | default('') | length == 0
     - venv_python.stat.exists | default(false)
-

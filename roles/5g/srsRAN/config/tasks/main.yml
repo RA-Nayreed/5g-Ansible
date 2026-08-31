@@ -1,18 +1,25 @@
 ---
 
+- name: Save current interpreter
+  ansible.builtin.set_fact:
+    _original_python_interpreter: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+
+- name: Use explicitly prepared Python interpreter
+  ansible.builtin.set_fact:
+    ansible_python_interpreter: "{{ fiveg_python_interpreter }}"
+  when: fiveg_python_interpreter | default('') | length > 0
+
 - name: Check if ansible venv python exists
   ansible.builtin.stat:
     path: /opt/ansible-venv/bin/python
   register: venv_python
-
-- name: Save current interpreter
-  ansible.builtin.set_fact:
-    _original_python_interpreter: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  when: fiveg_python_interpreter | default('') | length == 0
 
 - name: Switch to venv python if available
   ansible.builtin.set_fact:
     ansible_python_interpreter: /opt/ansible-venv/bin/python
   when:
+    - fiveg_python_interpreter | default('') | length == 0
     - venv_python.stat.exists
     - core == 'free5gc'
     - core_node_name != ran_node_name
@@ -26,7 +33,19 @@
     name: python3-kubernetes
     state: present
   become: yes
-  
+  when:
+    - fiveg_manage_python_dependencies | default(true) | bool
+    - fiveg_allow_live_installs | default(true) | bool
+
+- name: Verify prepared kubernetes Python client
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+      - -c
+      - import kubernetes
+  changed_when: false
+  when: not (fiveg_manage_python_dependencies | default(true) | bool and fiveg_allow_live_installs | default(true) | bool)
+
 - name: Remove existing srsRAN Helm directory to ensure clean state
   ansible.builtin.file:
     path: "{{ repo_dest }}"
@@ -46,8 +65,6 @@
     kind: Namespace
     name: "{{ ran_ns }}"
     state: present
-  vars:
-    ansible_python_interpreter: "{{ ansible_playbook_python }}"
 
 - name: Gather env facts (remote)
   ansible.builtin.setup:
@@ -67,15 +84,15 @@
       benetel1: values-benetel1.yaml
       benetel2: values-benetel2.yaml
       liteon: values-liteon.yaml
-      n300: values-n300-n78-20MHz.yaml # values-n300.yaml is original FDD, band 3
-      n320: values-n320-n78-20MHz.yaml # values-n320.yaml is original FDD, band 3
+      n300: values-n300-n78-20MHz.yaml
+      n320: values-n320-n78-20MHz.yaml
       rfsim: values-rfsim.yaml
 
 - name: Build absolute values_file path
   ansible.builtin.set_fact:
     values_file: "{{ [repo_dest_abs, 'charts', 'srsran-gnb', values_filename] | path_join }}"
 
-- name: debug
+- name: Show resolved srsRAN paths
   ansible.builtin.debug:
     msg:
       - "repo_dest_abs='{{ repo_dest_abs }}'"
@@ -132,6 +149,14 @@
       .namespace = "{{ ran_ns }}"
     ' "{{ values_file }}"
 
+- name: Pin N300 UHD management and primary data address to the R2Lab reference
+  ansible.builtin.shell: >
+    {{ yq_bin_path }} eval -i '
+      .gnbConfig.ru_sdr.device_args =
+      "mgmt_addr=192.168.235.103,addr=192.168.235.103,name=ni-n3xx-31D98C7,product=n300,num_recv_frames=32,num_send_frames=32,recv_frame_size=8000,send_frame_size=8000,master_clock_rate=122.88e6"
+    ' "{{ values_file }}"
+  when: rru == 'n300'
+
 - name: Fix device_args for rfsim GNU Radio single-channel multi-UE
   ansible.builtin.shell: >
     {{ yq_bin_path }} eval -i '
@@ -161,8 +186,6 @@
       spec:
         config: "{{ {'cniVersion': '0.3.1', 'name': n3networkName, 'type': 'ovs', 'bridge': 'n3br', 'ipam': {'type': 'static'}} | to_json }}"
   when: core == 'oai'
-  
-# --- rfsim only: UE list + srsue values file ---
 
 - name: Load 5G profile vars
   ansible.builtin.include_vars:

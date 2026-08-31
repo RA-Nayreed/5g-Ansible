@@ -23,7 +23,7 @@ DEFAULT_ARP = {"priority_level": 8,
 FIVEG_PROFILE = {
     "plmn": {"mcc": "{{ profile.plmn.mcc }}", "mnc": "{{ profile.plmn.mnc }}"},
     "slices": {
-    {% for s in profile.slices %}
+    {% for s in fiveg_effective_slices | default(profile.slices) %}
         "{{ s.name }}": {
             "sst": {{ s.sst | int }},
             "sd": "{{ 'FFFFFF' if s.sd == 'EMPTY' else s.sd.zfill(6) }}",
@@ -42,7 +42,7 @@ FIVEG_PROFILE = {
     {% endfor %}
     },
     "ues": {
-    {% for ue_name, ue in profile.ues.items() %}
+    {% for ue_name, ue in (fiveg_effective_ues | default(profile.ues)).items() %}
         "{{ ue_name }}": {
             "imsi_suffix": "{{ ue.imsi_suffix }}",
             "key": "{{ profile.security.full_key }}",
@@ -65,6 +65,7 @@ def generate_slices(profile):
         }
     return slices
 
+
 def generate_subscribers(profile, slices):
     subscribers = {}
     for ue_name, ue in profile["ues"].items():
@@ -84,6 +85,7 @@ def generate_subscribers(profile, slices):
             "__v": 0,
         }
     return subscribers
+
 
 def main():
     log.info("Generating slices and subscribers from 5G profile...")

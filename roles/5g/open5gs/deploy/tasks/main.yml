@@ -2,6 +2,12 @@
 - name: START_OPEN5GS_DEPLOY
   ansible.builtin.meta: noop
 
+- name: Resolve Open5GS Python interpreter
+  ansible.builtin.set_fact:
+    open5gs_python_interpreter: >-
+      {{ fiveg_python_interpreter if (fiveg_python_interpreter | default('') | length > 0)
+         else (repo_dest ~ '/venv/bin/python') }}
+
 - name: Python venv setup block (fhi72 only)
   block:
     - name: Install python3-venv, python3-pip, setuptools and wheel
@@ -14,7 +20,7 @@
         state: present
       become: yes
 
-    - name: Install kubernetes Python library for Ansible (via pip with --break-system-packages)
+    - name: Install kubernetes Python library for Ansible
       ansible.builtin.pip:
         name: kubernetes
         state: present
@@ -51,8 +57,12 @@
       ansible.builtin.command:
         cmd: "{{ repo_dest }}/venv/bin/pip install -r {{ repo_dest }}/requirements.txt"
       become: yes
-
-  when: core_node_name == ran_node_name and core == "open5gs" and fhi72
+  when:
+    - core_node_name == ran_node_name
+    - core == "open5gs"
+    - fhi72
+    - fiveg_manage_python_dependencies | default(true) | bool
+    - fiveg_allow_live_installs | default(true) | bool
 
 - name: Reload and restart kubelet
   ansible.builtin.shell: |
@@ -60,6 +70,7 @@
     systemctl restart kubelet
   become: true
   changed_when: false
+  when: fiveg_disruptive_cluster_ops_enabled | default(true) | bool
 
 - name: Restart CoreDNS pods after kubelet restart
   ansible.builtin.shell: |
@@ -67,6 +78,7 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   changed_when: false
+  when: fiveg_disruptive_cluster_ops_enabled | default(true) | bool
 
 - name: Wait for CoreDNS to be Ready
   ansible.builtin.shell: |
@@ -80,6 +92,7 @@
   delay: 10
   until: wait_coredns.rc == 0
   changed_when: false
+  when: fiveg_disruptive_cluster_ops_enabled | default(true) | bool
 
 - name: Test CoreDNS resolution from core node
   become: true
@@ -94,6 +107,7 @@
     done
     kubectl delete pod dns-test-{{ groups['core_node'][0] }} --ignore-not-found
   changed_when: false
+  when: fiveg_disruptive_cluster_ops_enabled | default(true) | bool
 
 - name: Ensure Open5GS namespace exists
   kubernetes.core.k8s:
@@ -166,6 +180,14 @@
     state: present
     update_cache: yes
   become: yes
+  when:
+    - fiveg_manage_os_dependencies | default(true) | bool
+    - fiveg_allow_live_installs | default(true) | bool
+
+- name: Verify prepared jq
+  ansible.builtin.command: jq --version
+  changed_when: false
+  when: not (fiveg_manage_os_dependencies | default(true) | bool and fiveg_allow_live_installs | default(true) | bool)
 
 - name: Wait for Multus CRD
   ansible.builtin.shell: kubectl get crd network-attachment-definitions.k8s.cni.cncf.io
@@ -179,17 +201,11 @@
 - name: Install OVS CNI via Cluster Network Addons Operator (single-node)
   block:
     - name: Apply Cluster Network Addons Operator namespace
-      ansible.builtin.shell: |
-        kubectl apply -f https://github.com/kubevirt/cluster-network-addons-operator/releases/download/v0.98.1/namespace.yaml
-
+      ansible.builtin.shell: kubectl apply -f https://github.com/kubevirt/cluster-network-addons-operator/releases/download/v0.98.1/namespace.yaml
     - name: Apply Cluster Network Addons CRDs
-      ansible.builtin.shell: |
-        kubectl apply -f https://github.com/kubevirt/cluster-network-addons-operator/releases/download/v0.98.1/network-addons-config.crd.yaml
-
+      ansible.builtin.shell: kubectl apply -f https://github.com/kubevirt/cluster-network-addons-operator/releases/download/v0.98.1/network-addons-config.crd.yaml
     - name: Apply Cluster Network Addons Operator
-      ansible.builtin.shell: |
-        kubectl apply -f https://github.com/kubevirt/cluster-network-addons-operator/releases/download/v0.98.1/operator.yaml
-
+      ansible.builtin.shell: kubectl apply -f https://github.com/kubevirt/cluster-network-addons-operator/releases/download/v0.98.1/operator.yaml
     - name: Create NetworkAddonsConfig for OVS
       ansible.builtin.copy:
         dest: /tmp/netaddonsconf.yaml
@@ -200,14 +216,10 @@
             name: cluster
           spec:
             ovs: {}
-
     - name: Apply NetworkAddonsConfig
-      ansible.builtin.shell: |
-        kubectl apply -f /tmp/netaddonsconf.yaml
-
+      ansible.builtin.shell: kubectl apply -f /tmp/netaddonsconf.yaml
     - name: Wait for NetworkAddonsConfig to become Available
-      ansible.builtin.shell: |
-        kubectl wait networkaddonsconfig cluster --for condition=Available --timeout=300s
+      ansible.builtin.shell: kubectl wait networkaddonsconfig cluster --for condition=Available --timeout=300s
   when: core_node_name == ran_node_name and core == "open5gs"
   become: yes
 
@@ -254,7 +266,6 @@
         ovs-vsctl --no-headings list-br | grep -q "n4br" || ovs-vsctl add-br n4br
       become: true
       changed_when: false
-
     - name: Bring OVS bridges up
       ansible.builtin.shell: |
         ip link set dev n2br up || true
@@ -262,7 +273,6 @@
         ip link set dev n4br up || true
       become: true
       changed_when: false
-
     - name: Remove any stale veth ports from bridges
       ansible.builtin.shell: |
         for br in n2br n3br n4br; do
@@ -272,7 +282,6 @@
         done
       become: true
       changed_when: false
-
   when: core_node_name == ran_node_name and core == "open5gs" and fhi72
 
 - name: Bring OVS bridges up if single-node Open5GS (non-FHI72)
@@ -297,8 +306,7 @@
   when: core_node_name == ran_node_name and core == "open5gs"
 
 - name: Wait for OVS resource registration on Node (optional for FHI72)
-  ansible.builtin.shell: |
-    kubectl get node {{ inventory_hostname }} -o json | grep -q "ovs-cni.network.kubevirt.io/n3br"
+  ansible.builtin.shell: kubectl get node {{ inventory_hostname }} -o json | grep -q "ovs-cni.network.kubevirt.io/n3br"
   register: ovs_res_check
   until: ovs_res_check.rc == 0
   retries: 10
@@ -347,39 +355,51 @@
   when: core == "open5gs"
   changed_when: false
 
-- name: Install python3-venv, python3-pip, setuptools and wheel
-  ansible.builtin.apt:
-    name:
-      - python3-venv
-      - python3-pip
-      - python3-setuptools
-      - python3-wheel
-    state: present
-  become: yes
+- name: Prepare Open5GS Python runtime
+  block:
+    - name: Install python3-venv, python3-pip, setuptools and wheel
+      ansible.builtin.apt:
+        name:
+          - python3-venv
+          - python3-pip
+          - python3-setuptools
+          - python3-wheel
+        state: present
+      become: yes
+    - name: Create Python virtual environment (idempotent)
+      ansible.builtin.command:
+        cmd: python3 -m venv "{{ repo_dest }}/venv"
+        creates: "{{ repo_dest }}/venv/bin/activate"
+      become: yes
+    - name: Bootstrap pip, setuptools and wheel in venv
+      ansible.builtin.command:
+        cmd: "{{ repo_dest }}/venv/bin/python -m ensurepip --upgrade"
+      become: yes
+    - name: Upgrade pip, setuptools and wheel explicitly in venv
+      ansible.builtin.command:
+        cmd: "{{ repo_dest }}/venv/bin/pip install --upgrade pip setuptools wheel"
+      become: yes
+    - name: Install Python requirements in venv
+      ansible.builtin.command:
+        cmd: "{{ repo_dest }}/venv/bin/pip install -r {{ repo_dest }}/requirements.txt"
+      become: yes
+  when:
+    - fiveg_manage_python_dependencies | default(true) | bool
+    - fiveg_allow_live_installs | default(true) | bool
+    - fiveg_python_interpreter | default('') | length == 0
 
-- name: Create Python virtual environment (idempotent)
+- name: Verify prepared Open5GS Python runtime
   ansible.builtin.command:
-    cmd: python3 -m venv "{{ repo_dest }}/venv"
-    creates: "{{ repo_dest }}/venv/bin/activate"
-  become: yes
-
-- name: Bootstrap pip, setuptools and wheel in venv
-  ansible.builtin.command:
-    cmd: "{{ repo_dest }}/venv/bin/python -m ensurepip --upgrade"
-  become: yes
-
-- name: Upgrade pip, setuptools and wheel explicitly in venv
-  ansible.builtin.command:
-    cmd: "{{ repo_dest }}/venv/bin/pip install --upgrade pip setuptools wheel"
-  become: yes
-
-- name: Install Python requirements in venv
-  ansible.builtin.command:
-    cmd: "{{ repo_dest }}/venv/bin/pip install -r {{ repo_dest }}/requirements.txt"
-  become: yes
+    argv:
+      - "{{ open5gs_python_interpreter }}"
+      - -c
+      - import pymongo, ruamel.yaml
+  changed_when: false
+  when: fiveg_python_interpreter | default('') | length > 0 or not (fiveg_manage_python_dependencies | default(true) | bool)
 
 - name: Deploy Open5GS Web UI
   ansible.builtin.command: kubectl apply -k "{{ repo_dest }}/open5gs-webui" -n {{ open5gs_ns }}
+  when: open5gs_webui_enabled | default(true) | bool
 
 - name: Wait for WebUI pod Ready
   kubernetes.core.k8s_info:
@@ -395,26 +415,31 @@
   delay: 5
   failed_when: false
   changed_when: false
+  when: open5gs_webui_enabled | default(true) | bool
 
 - name: Warn if WebUI not ready
   ansible.builtin.debug:
     msg: "WebUI pod not Ready — continuing (optional component)"
-  when: webui_pod is failed or
-        webui_pod.resources | length == 0 or
-        not (webui_pod.resources[0].status.containerStatuses[0].ready | default(false))
+  when:
+    - open5gs_webui_enabled | default(true) | bool
+    - webui_pod is failed or webui_pod.resources | length == 0 or not (webui_pod.resources[0].status.containerStatuses[0].ready | default(false))
 
 - name: Run Python scripts to generate and add subscribers
   ansible.builtin.shell: |
-    {{ repo_dest }}/venv/bin/python {{ repo_dest }}/mongo-tools/generate-data-fiveg.py
-    {{ repo_dest }}/venv/bin/python {{ repo_dest }}/mongo-tools/add-subscribers.py
+    {{ open5gs_python_interpreter }} {{ repo_dest }}/mongo-tools/generate-data-fiveg.py
+    {{ open5gs_python_interpreter }} {{ repo_dest }}/mongo-tools/add-subscribers.py
   args:
     chdir: "{{ repo_dest }}"
+  no_log: true
 
 - name: Run add-admin-account.py
   ansible.builtin.command: >
-    {{ repo_dest }}/venv/bin/python mongo-tools/add-admin-account.py
+    {{ open5gs_python_interpreter }} mongo-tools/add-admin-account.py
   args:
     chdir: "{{ repo_dest }}"
+  when:
+    - open5gs_webui_enabled | default(true) | bool
+    - open5gs_admin_account_enabled | default(true) | bool
 
 - name: Check Open5GS deployment
   ansible.builtin.include_role:

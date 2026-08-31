@@ -46,7 +46,7 @@ data:
             mcc: {{ fiveg.plmn.mcc }}
             mnc: {{ fiveg.plmn.mnc }}
           s_nssai:
-{% for slice in fiveg.slices %}
+{% for slice in fiveg_effective_slices | default(fiveg.slices) %}
             - sst: {{ slice.sst }}
               sd: {{ "FFFFFF" if slice.sd == "EMPTY" else slice.sd }}
 {% endfor %}
@@ -64,12 +64,9 @@ data:
   wrapper.sh: |
     #!/bin/bash
 
-    # Wait for Multus to assign the IP 10.10.3.200 to the n3 interface
-    # This prevents the "Cannot assign requested address" error during SCTP bind
     echo "Waiting for interface n3 to be ready with IP 10.10.3.200..."
     while ! ip addr show dev n3 | grep -q "10.10.3.200"; do
       sleep 2
     done
 
-    # Start the Open5GS AMF daemon
     /open5gs/install/bin/open5gs-amfd -c /open5gs/config/amfcfg.yaml

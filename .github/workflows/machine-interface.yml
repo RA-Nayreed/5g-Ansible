@@ -1,0 +1,45 @@
+name: machine-interface
+
+on:
+  push:
+    branches:
+      - refactor/machine-api
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install validation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install PyYAML ansible-core
+          ansible-galaxy collection install -r collections/requirements.yml
+      - name: Compile machine interface
+        run: python -m py_compile tools/fiveg_machine.py
+      - name: Run machine-interface unit tests
+        run: python -m unittest tests.test_machine_interface
+      - name: Validate declarative example and generate Ansible inputs
+        run: |
+          python tools/fiveg_machine.py plan --spec examples/deployment-machine.yaml --state-root /tmp/fiveg-state --json >/tmp/plan.json
+          python - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('fiveg_machine', 'tools/fiveg_machine.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          deployment = module.load_spec(Path('examples/deployment-machine.yaml'))
+          Path('/tmp/hosts.ini').write_text(module.inventory(deployment), encoding='utf-8')
+          Path('/tmp/vars.json').write_text(__import__('json').dumps(module.extra_vars(deployment)), encoding='utf-8')
+          PY
+      - name: Syntax-check deployment playbooks
+        run: |
+          ansible-playbook --syntax-check -i /tmp/hosts.ini -e @/tmp/vars.json playbooks/deploy.yml
+          ansible-playbook --syntax-check -i /tmp/hosts.ini -e @/tmp/vars.json playbooks/deploy_r2lab.yml
+          ansible-playbook --syntax-check -i /tmp/hosts.ini -e @/tmp/vars.json playbooks/down.yml
+      - name: Enforce no global R2Lab shutdown
+        run: '! grep -R --line-number --fixed-strings "all-off" roles/r2lab'

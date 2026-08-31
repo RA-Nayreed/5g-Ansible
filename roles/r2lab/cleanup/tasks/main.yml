@@ -1,8 +1,37 @@
 ---
-- name: Power OFF R2Lab testbed
-  shell: |
+- name: Resolve selected R2Lab UEs
+  ansible.builtin.set_fact:
+    r2lab_selected_ues: >-
+      {{ (groups['qhats'] | default([]))
+         + (groups['qfits'] | default([]))
+         + (groups['phones'] | default([])) }}
+
+- name: Stop only selected R2Lab UEs
+  ansible.builtin.include_role:
+    name: r2lab/ue/stop
+  loop: "{{ r2lab_selected_ues }}"
+  loop_control:
+    loop_var: ue_item
+
+- name: Power OFF only selected RRU
+  ansible.builtin.shell: |
+    set -e
     source ~/.bashrc
-    all-off
+    rhubarbe pdu off "{{ rru }}"
   args:
     executable: /bin/bash
-  ignore_errors: yes
+  when: rru | default('rfsim') != 'rfsim'
+
+- name: Verify selected RRU is no longer ON
+  ansible.builtin.shell: |
+    source ~/.bashrc
+    rhubarbe pdu status "{{ rru }}"
+  args:
+    executable: /bin/bash
+  register: selected_rru_status
+  changed_when: false
+  failed_when: false
+  retries: 12
+  delay: 2
+  until: "'on' not in (selected_rru_status.stdout | lower).split()"
+  when: rru | default('rfsim') != 'rfsim'

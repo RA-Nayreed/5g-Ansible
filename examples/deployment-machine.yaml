@@ -1,0 +1,52 @@
+schema: fiveg/deployment/v1
+id: example-open5gs-srsran-n300
+
+core:
+  type: open5gs
+  node: sopnode-f2
+
+ran:
+  type: srsRAN
+  node: sopnode-f3
+
+platform:
+  type: r2lab
+  ru: n300
+
+ues:
+  qhats: []
+  qfits: [qfit07]
+  phones: []
+
+monitoring:
+  enabled: false
+
+profile: default
+
+reservation:
+  enabled: true
+  duration_minutes: 120
+  r2lab_mode: require-existing
+
+deployment:
+  prepare_only: false
+  allow_live_installs: true
+  manage_os_dependencies: true
+  manage_python_dependencies: true
+  disruptive_cluster_ops_enabled: true
+  k8s_env_enabled: true
+  python_interpreter: ""
+  selected_slices: []
+  selected_ues: []
+  open5gs_webui_enabled: true
+  open5gs_admin_account_enabled: true
+  pos_manage_allocation: true
+  cleanup_namespaces: []
+  extra_vars: {}
+
+scenario:
+  type: none
+
+r2lab:
+  username: your_slice_name
+  strict_host_key_checking: true
