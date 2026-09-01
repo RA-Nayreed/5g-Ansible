@@ -1,6 +1,12 @@
 schema: fiveg/deployment/v1
 id: example-open5gs-srsran-n300
 
+provider:
+  manage: true
+  project: post5g-beta
+  experiment: example-open5gs-srsran-n300
+  experiment_duration: 4h
+
 core:
   type: open5gs
   node: sopnode-f2

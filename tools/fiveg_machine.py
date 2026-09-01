@@ -36,6 +36,8 @@ NODE_FACTS = {
 }
 PHONE_SERIAL = {"phone1": "MDX0220623006208", "phone2": "34061FDH20068M"}
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+CONTEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+DURATION_RE = re.compile(r"^[1-9][0-9]*(?:m|h)$")
 VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -70,6 +72,12 @@ def bool_value(value: Any, label: str, default: bool) -> bool:
 def node(value: Any, label: str) -> str:
     if not isinstance(value, str) or value not in NODE_FACTS:
         raise FiveGError(f"{label} must be one of: {', '.join(NODE_FACTS)}")
+    return value
+
+
+def safe_context(value: Any, label: str) -> str:
+    if not isinstance(value, str) or CONTEXT_RE.fullmatch(value) is None:
+        raise FiveGError(f"{label} contains unsafe characters")
     return value
 
 
@@ -120,7 +128,11 @@ def normalize(raw: Any) -> dict[str, Any]:
     qhats = string_list(ues.get("qhats", []), "ues.qhats")
     qfits = string_list(ues.get("qfits", []), "ues.qfits")
     phones = string_list(ues.get("phones", []), "ues.phones")
-    for label, values, allowed in (("ues.qhats", qhats, QHATS), ("ues.qfits", qfits, QFITS), ("ues.phones", phones, PHONES)):
+    for label, values, allowed in (
+        ("ues.qhats", qhats, QHATS),
+        ("ues.qfits", qfits, QFITS),
+        ("ues.phones", phones, PHONES),
+    ):
         unknown = sorted(set(values).difference(allowed))
         if unknown:
             raise FiveGError(f"{label} contains unsupported values: {', '.join(unknown)}")
@@ -136,6 +148,18 @@ def normalize(raw: Any) -> dict[str, Any]:
         raise FiveGError("profile has unsafe characters")
     if not (ROOT / "group_vars" / "all" / f"5g_profile_{profile}.yaml").is_file():
         raise FiveGError(f"unknown 5G profile: {profile}")
+
+    provider = mapping(spec.get("provider", {}), "provider")
+    provider_managed = bool_value(provider.get("manage"), "provider.manage", False)
+    provider_project = ""
+    provider_experiment = ""
+    provider_duration = "4h"
+    if provider_managed:
+        provider_project = safe_context(provider.get("project"), "provider.project")
+        provider_experiment = safe_context(provider.get("experiment", deployment_id), "provider.experiment")
+        provider_duration = provider.get("experiment_duration", "4h")
+        if not isinstance(provider_duration, str) or DURATION_RE.fullmatch(provider_duration) is None:
+            raise FiveGError("provider.experiment_duration must look like 30m or 4h")
 
     reservation = mapping(spec.get("reservation", {}), "reservation")
     reservation_enabled = bool_value(reservation.get("enabled"), "reservation.enabled", True)
@@ -169,6 +193,12 @@ def normalize(raw: Any) -> dict[str, Any]:
     result = {
         "schema": SCHEMA,
         "id": deployment_id,
+        "provider": {
+            "manage": provider_managed,
+            "project": provider_project,
+            "experiment": provider_experiment,
+            "experiment_duration": provider_duration,
+        },
         "core": {"type": core_type, "node": core_node},
         "ran": {"type": ran_type, "node": ran_node},
         "platform": {"type": platform_type, "ru": ru},
@@ -354,6 +384,50 @@ def playbook(inv: Path, vars_path: Path, name: str) -> list[str]:
     return ["ansible-playbook", "-i", str(inv), "-e", f"@{vars_path}", str(ROOT / name)]
 
 
+def provider_context(spec: Mapping[str, Any], state: dict[str, Any], *, create_missing: bool) -> None:
+    provider = spec["provider"]
+    if not provider["manage"]:
+        return
+    project = provider["project"]
+    experiment = provider["experiment"]
+    selected = run(["slices", "project", "use", project], check=False)
+    if selected.returncode:
+        raise FiveGError("SLICES project selection failed")
+    shown = run(["slices", "experiment", "show", experiment], check=False)
+    created = False
+    if shown.returncode:
+        if not create_missing:
+            raise FiveGError("SLICES experiment is missing during resume")
+        created_result = run(
+            ["slices", "experiment", "create", experiment, "--duration", provider["experiment_duration"]],
+            check=False,
+        )
+        if created_result.returncode:
+            raise FiveGError("SLICES experiment creation failed")
+        created = True
+    prefix = run(["post5g", "experiment", "prefix", experiment], check=False)
+    if prefix.returncode or not prefix.stdout.strip():
+        raise FiveGError("Post5G provider network acquisition failed")
+    try:
+        network = json.loads(prefix.stdout)
+    except json.JSONDecodeError as exc:
+        raise FiveGError("Post5G provider network is not JSON") from exc
+    if not isinstance(network, dict):
+        raise FiveGError("Post5G provider network must be one JSON object")
+    for key in ("subnet", "lb", "expiration_time"):
+        if not isinstance(network.get(key), str) or not str(network[key]).strip():
+            raise FiveGError(f"Post5G provider network is missing {key}")
+    previous = state.get("provider")
+    previously_created = bool(previous.get("experiment_created")) if isinstance(previous, Mapping) else False
+    state["provider"] = {
+        "type": "slices",
+        "project": project,
+        "experiment": experiment,
+        "experiment_created": previously_created or created,
+        "network": network,
+    }
+
+
 def reserve(spec: Mapping[str, Any], state: dict[str, Any]) -> None:
     if not spec["reservation"]["enabled"]:
         return
@@ -403,92 +477,194 @@ def runtime_files(spec: Mapping[str, Any], directory: Path) -> tuple[Path, Path]
     directory.mkdir(parents=True, exist_ok=True)
     inv, var = directory / "hosts.ini", directory / "vars.json"
     inv.write_text(inventory(spec), encoding="utf-8")
-    write_json(var, extra_vars(spec)); write_json(directory / "spec.json", spec)
+    write_json(var, extra_vars(spec))
+    write_json(directory / "spec.json", spec)
     return inv, var
 
 
 def emit(value: Any, as_json: bool) -> None:
     if as_json:
-        print(json.dumps(value, indent=2, sort_keys=True)); return
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return
     for key, item in value.items():
         print(f"{key}: {json.dumps(item, sort_keys=True) if isinstance(item, (dict,list)) else item}")
 
 
 def capabilities(args: argparse.Namespace) -> int:
-    emit({"schema": "fiveg/capabilities/v1", "cores": list(CORES), "rans": list(RANS), "platforms": list(PLATFORMS), "rus_by_ran": {k:list(v) for k,v in RUS.items()}, "ues": {"qhats":list(QHATS),"qfits":list(QFITS),"phones":list(PHONES)}, "monitoring":["5G-Monarch"], "scenarios":list(SCENARIOS), "profiles": sorted(p.stem.removeprefix("5g_profile_") for p in (ROOT/"group_vars"/"all").glob("5g_profile_*.yaml")), "advanced": "deployment.extra_vars passes any existing Ansible feature without a second support matrix"}, args.json)
+    emit(
+        {
+            "schema": "fiveg/capabilities/v1",
+            "providers": ["slices"],
+            "cores": list(CORES),
+            "rans": list(RANS),
+            "platforms": list(PLATFORMS),
+            "rus_by_ran": {k: list(v) for k, v in RUS.items()},
+            "ues": {"qhats": list(QHATS), "qfits": list(QFITS), "phones": list(PHONES)},
+            "monitoring": ["5G-Monarch"],
+            "scenarios": list(SCENARIOS),
+            "profiles": sorted(p.stem.removeprefix("5g_profile_") for p in (ROOT / "group_vars" / "all").glob("5g_profile_*.yaml")),
+            "advanced": "deployment.extra_vars passes any existing Ansible feature without a second support matrix",
+        },
+        args.json,
+    )
     return 0
 
 
 def plan(args: argparse.Namespace) -> int:
-    spec = load_spec(Path(args.spec)); directory = state_root(args.state_root) / spec["id"]
-    commands = [["ansible-galaxy","install","-r","collections/requirements.yml"]]
-    if spec["platform"]["type"] == "r2lab": commands.append(["ansible-playbook","-i",str(directory/"hosts.ini"),"-e",f"@{directory/'vars.json'}","playbooks/deploy_r2lab.yml"])
-    commands.append(["ansible-playbook","-i",str(directory/"hosts.ini"),"-e",f"@{directory/'vars.json'}","playbooks/deploy.yml"])
-    emit({"schema":"fiveg/deployment-plan/v1","id":spec["id"],"spec_sha256":digest(spec),"state_directory":str(directory),"commands":commands,"spec":spec}, args.json); return 0
+    spec = load_spec(Path(args.spec))
+    directory = state_root(args.state_root) / spec["id"]
+    commands = [["ansible-galaxy", "install", "-r", "collections/requirements.yml"]]
+    if spec["platform"]["type"] == "r2lab":
+        commands.append(["ansible-playbook", "-i", str(directory / "hosts.ini"), "-e", f"@{directory / 'vars.json'}", "playbooks/deploy_r2lab.yml"])
+    commands.append(["ansible-playbook", "-i", str(directory / "hosts.ini"), "-e", f"@{directory / 'vars.json'}", "playbooks/deploy.yml"])
+    emit({"schema": "fiveg/deployment-plan/v1", "id": spec["id"], "spec_sha256": digest(spec), "state_directory": str(directory), "commands": commands, "spec": spec}, args.json)
+    return 0
 
 
 def up(args: argparse.Namespace) -> int:
-    spec = load_spec(Path(args.spec)); directory = state_root(args.state_root) / spec["id"]
-    if directory.exists() and not args.resume: raise FiveGError(f"state exists: {directory}; use --resume")
+    spec = load_spec(Path(args.spec))
+    directory = state_root(args.state_root) / spec["id"]
+    if directory.exists() and not args.resume:
+        raise FiveGError(f"state exists: {directory}; use --resume")
     inv, var = runtime_files(spec, directory)
-    state = {"schema":"fiveg/deployment-state/v1","id":spec["id"],"spec_sha256":digest(spec),"fiveg_ansible_commit":commit(),"state":"preparing"}
-    if (directory/"state.json").is_file() and args.resume: state = json.loads((directory/"state.json").read_text())
-    write_json(directory/"state.json", state)
+    state = {"schema": "fiveg/deployment-state/v1", "id": spec["id"], "spec_sha256": digest(spec), "fiveg_ansible_commit": commit(), "state": "preparing"}
+    if (directory / "state.json").is_file() and args.resume:
+        state = json.loads((directory / "state.json").read_text())
+    write_json(directory / "state.json", state)
     try:
-        if not args.resume: reserve(spec, state); r2lab_authority(spec, state); write_json(directory/"state.json", state)
-        run(["ansible-galaxy","install","-r",str(ROOT/"collections/requirements.yml")], directory/"collections.log")
-        if spec["platform"]["type"] == "r2lab": state["state"]="r2lab-preparing"; write_json(directory/"state.json",state); run(playbook(inv,var,"playbooks/deploy_r2lab.yml"),directory/"r2lab.log")
-        state["state"]="deploying"; write_json(directory/"state.json",state); run(playbook(inv,var,"playbooks/deploy.yml"),directory/"deploy.log")
-        state["state"]="ready"; write_json(directory/"state.json",state)
-        manifest={"schema":"fiveg/deployment-manifest/v1","id":spec["id"],"state":"ready","spec_sha256":state["spec_sha256"],"fiveg_ansible_commit":state["fiveg_ansible_commit"],"core":spec["core"],"ran":spec["ran"],"platform":spec["platform"],"ues":spec["ues"],"monitoring":spec["monitoring"],"profile":spec["profile"],"state_directory":str(directory)}
-        write_json(directory/"manifest.json",manifest); emit(manifest,args.json); return 0
+        provider_context(spec, state, create_missing=not args.resume)
+        if not args.resume:
+            reserve(spec, state)
+            r2lab_authority(spec, state)
+        write_json(directory / "state.json", state)
+        run(["ansible-galaxy", "install", "-r", str(ROOT / "collections/requirements.yml")], directory / "collections.log")
+        if spec["platform"]["type"] == "r2lab":
+            state["state"] = "r2lab-preparing"
+            write_json(directory / "state.json", state)
+            run(playbook(inv, var, "playbooks/deploy_r2lab.yml"), directory / "r2lab.log")
+        state["state"] = "deploying"
+        write_json(directory / "state.json", state)
+        run(playbook(inv, var, "playbooks/deploy.yml"), directory / "deploy.log")
+        state["state"] = "ready"
+        write_json(directory / "state.json", state)
+        manifest = {
+            "schema": "fiveg/deployment-manifest/v1",
+            "id": spec["id"],
+            "state": "ready",
+            "spec_sha256": state["spec_sha256"],
+            "fiveg_ansible_commit": state["fiveg_ansible_commit"],
+            "provider": state.get("provider", {}),
+            "core": spec["core"],
+            "ran": spec["ran"],
+            "platform": spec["platform"],
+            "ues": spec["ues"],
+            "monitoring": spec["monitoring"],
+            "profile": spec["profile"],
+            "state_directory": str(directory),
+        }
+        write_json(directory / "manifest.json", manifest)
+        emit(manifest, args.json)
+        return 0
     except Exception:
-        state["state"]="failed"; write_json(directory/"state.json",state); raise
+        state["state"] = "failed"
+        write_json(directory / "state.json", state)
+        raise
 
 
-def load_state(args: argparse.Namespace) -> tuple[dict[str,Any],dict[str,Any],Path]:
-    directory=state_root(args.state_root)/args.deployment
-    try: return json.loads((directory/"state.json").read_text()), json.loads((directory/"spec.json").read_text()), directory
-    except FileNotFoundError as exc: raise FiveGError(f"unknown deployment: {args.deployment}") from exc
+def load_state(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    directory = state_root(args.state_root) / args.deployment
+    try:
+        return json.loads((directory / "state.json").read_text()), json.loads((directory / "spec.json").read_text()), directory
+    except FileNotFoundError as exc:
+        raise FiveGError(f"unknown deployment: {args.deployment}") from exc
 
 
 def status(args: argparse.Namespace) -> int:
-    state,spec,directory=load_state(args)
-    probe=run(["ansible","-i",str(directory/"hosts.ini"),"core_node","-b","-m","shell","-a","kubectl get nodes -o name 2>/dev/null; kubectl get pods -A --no-headers 2>/dev/null || true"],check=False)
-    emit({"schema":"fiveg/deployment-status/v1","id":args.deployment,"state":state.get("state","unknown"),"observation_returncode":probe.returncode,"observation":probe.stdout,"spec":spec},args.json); return 0 if probe.returncode==0 else 2
+    state, spec, directory = load_state(args)
+    probe = run(["ansible", "-i", str(directory / "hosts.ini"), "core_node", "-b", "-m", "shell", "-a", "kubectl get nodes -o name 2>/dev/null; kubectl get pods -A --no-headers 2>/dev/null || true"], check=False)
+    emit({"schema": "fiveg/deployment-status/v1", "id": args.deployment, "state": state.get("state", "unknown"), "provider": state.get("provider", {}), "observation_returncode": probe.returncode, "observation": probe.stdout, "spec": spec}, args.json)
+    return 0 if probe.returncode == 0 else 2
 
 
 def down(args: argparse.Namespace) -> int:
-    state,spec,directory=load_state(args); state["state"]="stopping"; write_json(directory/"state.json",state)
-    result=run(playbook(directory/"hosts.ini",directory/"vars.json","playbooks/down.yml"),directory/"down.log",check=False); release(state)
-    state["state"]="stopped" if result.returncode==0 else "cleanup-failed"; write_json(directory/"state.json",state)
-    emit({"schema":"fiveg/deployment-down/v1","id":args.deployment,"state":state["state"],"returncode":result.returncode},args.json); return 0 if result.returncode==0 else 2
+    state, _spec, directory = load_state(args)
+    state["state"] = "stopping"
+    write_json(directory / "state.json", state)
+    result = run(playbook(directory / "hosts.ini", directory / "vars.json", "playbooks/down.yml"), directory / "down.log", check=False)
+    release(state)
+    state["state"] = "stopped" if result.returncode == 0 else "cleanup-failed"
+    write_json(directory / "state.json", state)
+    emit({"schema": "fiveg/deployment-down/v1", "id": args.deployment, "state": state["state"], "returncode": result.returncode}, args.json)
+    return 0 if result.returncode == 0 else 2
 
 
-SCENARIO_PLAYBOOKS={"iperf":("playbooks/setup_iperf.yml","playbooks/run_scenario_iperf.yml"),"interference":("playbooks/setup_interference.yml","playbooks/run_scenario_interference.yml"),"multi-ue-iperf":("playbooks/setup_iperf.yml","playbooks/run_scenario_iperf_multi.yml"),"ping":("playbooks/setup_iperf.yml","playbooks/run_scenario_ping.yml"),"nuttcp":("playbooks/setup_iperf.yml","playbooks/run_scenario_nuttcp.yml")}
+SCENARIO_PLAYBOOKS = {
+    "iperf": ("playbooks/setup_iperf.yml", "playbooks/run_scenario_iperf.yml"),
+    "interference": ("playbooks/setup_interference.yml", "playbooks/run_scenario_interference.yml"),
+    "multi-ue-iperf": ("playbooks/setup_iperf.yml", "playbooks/run_scenario_iperf_multi.yml"),
+    "ping": ("playbooks/setup_iperf.yml", "playbooks/run_scenario_ping.yml"),
+    "nuttcp": ("playbooks/setup_iperf.yml", "playbooks/run_scenario_nuttcp.yml"),
+}
+
+
 def scenario(args: argparse.Namespace) -> int:
-    _,spec,directory=load_state(args); kind=args.type or spec["scenario"]["type"]
-    if kind not in SCENARIO_PLAYBOOKS: raise FiveGError("a concrete scenario type is required")
-    setup,target=SCENARIO_PLAYBOOKS[kind]
-    if not args.no_setup: run(playbook(directory/"hosts.ini",directory/"vars.json",setup),directory/f"scenario-{kind}-setup.log")
-    run(playbook(directory/"hosts.ini",directory/"vars.json",target),directory/f"scenario-{kind}.log")
-    emit({"schema":"fiveg/scenario-result/v1","deployment_id":args.deployment,"type":kind,"state":"completed"},args.json); return 0
+    _, spec, directory = load_state(args)
+    kind = args.type or spec["scenario"]["type"]
+    if kind not in SCENARIO_PLAYBOOKS:
+        raise FiveGError("a concrete scenario type is required")
+    setup, target = SCENARIO_PLAYBOOKS[kind]
+    if not args.no_setup:
+        run(playbook(directory / "hosts.ini", directory / "vars.json", setup), directory / f"scenario-{kind}-setup.log")
+    run(playbook(directory / "hosts.ini", directory / "vars.json", target), directory / f"scenario-{kind}.log")
+    emit({"schema": "fiveg/scenario-result/v1", "deployment_id": args.deployment, "type": kind, "state": "completed"}, args.json)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser=argparse.ArgumentParser(prog="fiveg",description=__doc__); sub=parser.add_subparsers(dest="command",required=True)
-    cap=sub.add_parser("capabilities"); cap.add_argument("--json",action="store_true"); cap.set_defaults(func=capabilities)
-    p=sub.add_parser("plan"); p.add_argument("--spec",required=True); p.add_argument("--state-root"); p.add_argument("--json",action="store_true"); p.set_defaults(func=plan)
-    u=sub.add_parser("up"); u.add_argument("--spec",required=True); u.add_argument("--state-root"); u.add_argument("--resume",action="store_true"); u.add_argument("--json",action="store_true"); u.set_defaults(func=up)
-    s=sub.add_parser("status"); s.add_argument("--deployment",required=True); s.add_argument("--state-root"); s.add_argument("--json",action="store_true"); s.set_defaults(func=status)
-    d=sub.add_parser("down"); d.add_argument("--deployment",required=True); d.add_argument("--state-root"); d.add_argument("--json",action="store_true"); d.set_defaults(func=down)
-    r=sub.add_parser("scenario"); r.add_argument("--deployment",required=True); r.add_argument("--state-root"); r.add_argument("--type",choices=list(SCENARIO_PLAYBOOKS)); r.add_argument("--no-setup",action="store_true"); r.add_argument("--json",action="store_true"); r.set_defaults(func=scenario)
+    parser = argparse.ArgumentParser(prog="fiveg", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    cap = sub.add_parser("capabilities")
+    cap.add_argument("--json", action="store_true")
+    cap.set_defaults(func=capabilities)
+    p = sub.add_parser("plan")
+    p.add_argument("--spec", required=True)
+    p.add_argument("--state-root")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=plan)
+    u = sub.add_parser("up")
+    u.add_argument("--spec", required=True)
+    u.add_argument("--state-root")
+    u.add_argument("--resume", action="store_true")
+    u.add_argument("--json", action="store_true")
+    u.set_defaults(func=up)
+    s = sub.add_parser("status")
+    s.add_argument("--deployment", required=True)
+    s.add_argument("--state-root")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=status)
+    d = sub.add_parser("down")
+    d.add_argument("--deployment", required=True)
+    d.add_argument("--state-root")
+    d.add_argument("--json", action="store_true")
+    d.set_defaults(func=down)
+    r = sub.add_parser("scenario")
+    r.add_argument("--deployment", required=True)
+    r.add_argument("--state-root")
+    r.add_argument("--type", choices=list(SCENARIO_PLAYBOOKS))
+    r.add_argument("--no-setup", action="store_true")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(func=scenario)
     return parser
 
 
-def main(argv: list[str] | None=None) -> int:
-    args=build_parser().parse_args(argv)
-    try: return int(args.func(args))
-    except (FiveGError,OSError,json.JSONDecodeError) as exc: print(f"fiveg: {exc}",file=sys.stderr); return 2
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return int(args.func(args))
+    except (FiveGError, OSError, json.JSONDecodeError) as exc:
+        print(f"fiveg: {exc}", file=sys.stderr)
+        return 2
 
-if __name__=="__main__": raise SystemExit(main())
+
+if __name__ == "__main__":
+    raise SystemExit(main())
