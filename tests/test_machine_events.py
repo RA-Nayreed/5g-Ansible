@@ -20,7 +20,7 @@ def load_events():
 
 
 class MachineEventTests(unittest.TestCase):
-    def test_event_channel_is_versioned_jsonl(self):
+    def test_event_channel_is_versioned_jsonl_with_upstream_message(self):
         events = load_events()
         stream = StringIO()
         emitter = events.EventEmitter(enabled=True, stream=stream)
@@ -36,6 +36,7 @@ class MachineEventTests(unittest.TestCase):
         self.assertEqual("deployment-001", payload["deployment_id"])
         self.assertEqual("provider", payload["phase"])
         self.assertEqual("completed", payload["event"])
+        self.assertEqual("SLICES provider", payload["message"])
         self.assertEqual("slices", payload["component"])
         self.assertEqual("project-a", payload["detail"]["project"])
 
@@ -59,13 +60,14 @@ class MachineEventTests(unittest.TestCase):
         payloads = [json.loads(line) for line in stream.getvalue().splitlines()]
         self.assertEqual(["started", "completed"], [item["event"] for item in payloads])
         self.assertTrue(all(item["phase"] == "deployment" for item in payloads))
+        self.assertTrue(all(item["message"] == "5G deployment" for item in payloads))
         self.assertTrue(all(item["component"] == "5g-stack" for item in payloads))
         rendered = stream.getvalue()
         self.assertNotIn("PLAY", rendered)
         self.assertNotIn("TASK", rendered)
         self.assertNotIn("changed:", rendered)
 
-    def test_provider_event_reports_machine_semantics_only(self):
+    def test_provider_event_reports_experiment_but_not_provider_network(self):
         events = load_events()
         stream = StringIO()
 
@@ -93,6 +95,7 @@ class MachineEventTests(unittest.TestCase):
         events.core.provider_context(spec, state, create_missing=True)
         payloads = [json.loads(line) for line in stream.getvalue().splitlines()]
         self.assertEqual(["started", "completed"], [item["event"] for item in payloads])
+        self.assertEqual("SLICES provider experiment experiment-a", payloads[-1]["message"])
         self.assertEqual("project-a", payloads[-1]["detail"]["project"])
         self.assertEqual("experiment-a", payloads[-1]["detail"]["experiment"])
         self.assertFalse(payloads[-1]["detail"]["experiment_created"])
