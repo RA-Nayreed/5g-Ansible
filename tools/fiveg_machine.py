@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
@@ -39,6 +40,9 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 CONTEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 DURATION_RE = re.compile(r"^[1-9][0-9]*(?:m|h)$")
 VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PROVIDER_PREFIX_ATTEMPTS_AFTER_CREATE = 12
+PROVIDER_PREFIX_ATTEMPTS_EXISTING = 3
+PROVIDER_PREFIX_INTERVAL_SECONDS = 5.0
 
 
 class FiveGError(RuntimeError):
@@ -384,6 +388,39 @@ def playbook(inv: Path, vars_path: Path, name: str) -> list[str]:
     return ["ansible-playbook", "-i", str(inv), "-e", f"@{vars_path}", str(ROOT / name)]
 
 
+def provider_network(experiment: str, *, attempts: int) -> dict[str, Any]:
+    if attempts < 1:
+        raise FiveGError("provider prefix attempts must be positive")
+    last_detail = "no response"
+    for attempt in range(1, attempts + 1):
+        prefix = run(["post5g", "experiment", "prefix", experiment], check=False)
+        text = prefix.stdout.strip()
+        if prefix.returncode == 0 and text:
+            try:
+                network = json.loads(text)
+            except json.JSONDecodeError:
+                last_detail = "provider response was not JSON"
+            else:
+                if isinstance(network, dict):
+                    missing = [
+                        key
+                        for key in ("subnet", "lb", "expiration_time")
+                        if not isinstance(network.get(key), str) or not str(network[key]).strip()
+                    ]
+                    if not missing:
+                        return network
+                    last_detail = "provider response was missing " + ", ".join(missing)
+                else:
+                    last_detail = "provider response was not one JSON object"
+        else:
+            last_detail = f"provider command exit={prefix.returncode}, output={'present' if text else 'empty'}"
+        if attempt < attempts:
+            time.sleep(PROVIDER_PREFIX_INTERVAL_SECONDS)
+    raise FiveGError(
+        f"Post5G provider network acquisition failed after {attempts} attempt(s): {last_detail}"
+    )
+
+
 def provider_context(spec: Mapping[str, Any], state: dict[str, Any], *, create_missing: bool) -> None:
     provider = spec["provider"]
     if not provider["manage"]:
@@ -405,18 +442,7 @@ def provider_context(spec: Mapping[str, Any], state: dict[str, Any], *, create_m
         if created_result.returncode:
             raise FiveGError("SLICES experiment creation failed")
         created = True
-    prefix = run(["post5g", "experiment", "prefix", experiment], check=False)
-    if prefix.returncode or not prefix.stdout.strip():
-        raise FiveGError("Post5G provider network acquisition failed")
-    try:
-        network = json.loads(prefix.stdout)
-    except json.JSONDecodeError as exc:
-        raise FiveGError("Post5G provider network is not JSON") from exc
-    if not isinstance(network, dict):
-        raise FiveGError("Post5G provider network must be one JSON object")
-    for key in ("subnet", "lb", "expiration_time"):
-        if not isinstance(network.get(key), str) or not str(network[key]).strip():
-            raise FiveGError(f"Post5G provider network is missing {key}")
+
     previous = state.get("provider")
     previously_created = bool(previous.get("experiment_created")) if isinstance(previous, Mapping) else False
     state["provider"] = {
@@ -424,8 +450,13 @@ def provider_context(spec: Mapping[str, Any], state: dict[str, Any], *, create_m
         "project": project,
         "experiment": experiment,
         "experiment_created": previously_created or created,
-        "network": network,
     }
+    attempts = (
+        PROVIDER_PREFIX_ATTEMPTS_AFTER_CREATE
+        if created
+        else PROVIDER_PREFIX_ATTEMPTS_EXISTING
+    )
+    state["provider"]["network"] = provider_network(experiment, attempts=attempts)
 
 
 def reserve(spec: Mapping[str, Any], state: dict[str, Any]) -> None:
@@ -530,22 +561,35 @@ def up(args: argparse.Namespace) -> int:
     state = {"schema": "fiveg/deployment-state/v1", "id": spec["id"], "spec_sha256": digest(spec), "fiveg_ansible_commit": commit(), "state": "preparing"}
     if (directory / "state.json").is_file() and args.resume:
         state = json.loads((directory / "state.json").read_text())
+    state.pop("failure", None)
     write_json(directory / "state.json", state)
+    phase = "provider"
     try:
         provider_context(spec, state, create_missing=not args.resume)
-        if not args.resume:
+        phase = "slices-reservation"
+        if spec["reservation"]["enabled"] and not isinstance(state.get("slices_reservation"), Mapping):
             reserve(spec, state)
+        phase = "r2lab-authority"
+        if (
+            spec["platform"]["type"] == "r2lab"
+            and spec["reservation"]["r2lab_mode"] != "none"
+            and not isinstance(state.get("r2lab_reservation"), Mapping)
+        ):
             r2lab_authority(spec, state)
         write_json(directory / "state.json", state)
+        phase = "collections"
         run(["ansible-galaxy", "install", "-r", str(ROOT / "collections/requirements.yml")], directory / "collections.log")
         if spec["platform"]["type"] == "r2lab":
+            phase = "r2lab-deployment"
             state["state"] = "r2lab-preparing"
             write_json(directory / "state.json", state)
             run(playbook(inv, var, "playbooks/deploy_r2lab.yml"), directory / "r2lab.log")
+        phase = "deployment"
         state["state"] = "deploying"
         write_json(directory / "state.json", state)
         run(playbook(inv, var, "playbooks/deploy.yml"), directory / "deploy.log")
         state["state"] = "ready"
+        state.pop("failure", None)
         write_json(directory / "state.json", state)
         manifest = {
             "schema": "fiveg/deployment-manifest/v1",
@@ -565,8 +609,9 @@ def up(args: argparse.Namespace) -> int:
         write_json(directory / "manifest.json", manifest)
         emit(manifest, args.json)
         return 0
-    except Exception:
+    except Exception as exc:
         state["state"] = "failed"
+        state["failure"] = {"phase": phase, "message": str(exc)}
         write_json(directory / "state.json", state)
         raise
 
