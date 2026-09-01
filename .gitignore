@@ -7,3 +7,5 @@ admin.conf
 inventory/default/hosts.ini
 results
 include
+__pycache__/
+*.py[cod]
