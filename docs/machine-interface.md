@@ -19,6 +19,24 @@ The default state root is `.fiveg/<deployment-id>/`. Each deployment stores the 
 
 The machine interface exposes the deployment choices already owned by this repository: Open5GS/OAI/Free5GC cores; OAI/srsRAN/UERANSIM RANs; RFSIM and R2Lab; the existing R2Lab RU and UE families; 5G-Monarch; profiles; and the existing iperf, interference, multi-UE iperf, ping and nuttcp scenarios. `deployment.extra_vars` is intentionally passed through so existing advanced Ansible features do not need to be mirrored in a controller-specific support matrix.
 
+## SLICES provider context
+
+Machine callers can delegate SLICES project/experiment ownership to 5g-Ansible:
+
+```yaml
+provider:
+  manage: true
+  project: post5g-beta
+  experiment: example-open5gs-srsran-n300
+  experiment_duration: 4h
+```
+
+When `provider.manage` is true, `up` selects the requested SLICES project, reuses the named experiment when it exists, creates it on the first deployment when it does not, and acquires the Post5G network prefix before making a POS reservation. The resulting provider identity and network are persisted in deployment state and the final `fiveg/deployment-manifest/v1` manifest.
+
+`up --resume` revalidates the same project, experiment and Post5G network but will not silently create a missing experiment. This keeps resume fail-closed and prevents a controller from changing provider identity behind an existing deployment.
+
+Provider experiments are not deleted by `down`; the deployment teardown releases the POS reservation and selected 5G resources while the named provider experiment remains reusable.
+
 ## Deployment policy
 
 Machine callers can express policy without rewriting the checked-out source:
