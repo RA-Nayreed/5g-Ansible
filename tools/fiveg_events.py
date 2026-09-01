@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Structured progress facade for the 5g-Ansible machine interface.
 
-The deployment engine remains in ``fiveg_machine.py``.  This facade adds an
+The deployment engine remains in ``fiveg_machine.py``. This facade adds an
 optional event channel without parsing Ansible output: ``--events`` emits
 ``fiveg/event/v1`` JSONL on stderr while stdout remains the final machine JSON.
+5g-Ansible owns both the semantic event and its human-facing progress message.
 """
 from __future__ import annotations
 
@@ -17,6 +18,16 @@ from typing import Any, Mapping, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 MACHINE_PATH = ROOT / "tools" / "fiveg_machine.py"
 EVENT_SCHEMA = "fiveg/event/v1"
+PHASE_MESSAGES = {
+    "provider": "SLICES provider",
+    "reservation": "SLICES reservation",
+    "r2lab-authority": "R2Lab authority",
+    "collections": "deployment dependencies",
+    "r2lab-deployment": "physical resources",
+    "deployment": "5G deployment",
+    "scenario": "5G scenario",
+    "cleanup": "5G cleanup",
+}
 
 _SPEC = importlib.util.spec_from_file_location("fiveg_machine_core", MACHINE_PATH)
 if _SPEC is None or _SPEC.loader is None:
@@ -42,17 +53,20 @@ class EventEmitter:
         phase: str,
         event: str,
         *,
+        message: str | None = None,
         component: str | None = None,
         detail: Mapping[str, Any] | None = None,
     ) -> None:
         if not self.enabled:
             return
+        rendered = message or PHASE_MESSAGES.get(phase, phase)
         payload: dict[str, Any] = {
             "schema": EVENT_SCHEMA,
             "time": _utc_now(),
             "deployment_id": deployment_id,
             "phase": phase,
             "event": event,
+            "message": rendered,
         }
         if component:
             payload["component"] = component
@@ -128,11 +142,20 @@ def install_event_wrappers(emitter: EventEmitter) -> None:
     def provider_context(spec, state, *, create_missing):
         deployment_id = str(spec["id"])
         provider = spec["provider"]
+        experiment = str(provider.get("experiment", deployment_id))
         detail = {
             "project": str(provider.get("project", "")),
-            "experiment": str(provider.get("experiment", deployment_id)),
+            "experiment": experiment,
         }
-        emitter.emit(deployment_id, "provider", "started", component="slices", detail=detail)
+        message = f"SLICES provider experiment {experiment}"
+        emitter.emit(
+            deployment_id,
+            "provider",
+            "started",
+            message=message,
+            component="slices",
+            detail=detail,
+        )
         try:
             result = original_provider_context(spec, state, create_missing=create_missing)
         except Exception as exc:
@@ -140,6 +163,7 @@ def install_event_wrappers(emitter: EventEmitter) -> None:
                 deployment_id,
                 "provider",
                 "failed",
+                message=message,
                 component="slices",
                 detail=_failure_detail(exc),
             )
@@ -152,6 +176,7 @@ def install_event_wrappers(emitter: EventEmitter) -> None:
             deployment_id,
             "provider",
             "completed",
+            message=message,
             component="slices",
             detail=completed,
         )
