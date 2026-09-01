@@ -23,6 +23,10 @@ jobs:
         run: python -m py_compile tools/fiveg_machine.py
       - name: Run machine-interface unit tests
         run: python -m unittest tests.test_machine_interface
+      - name: Prove machine invocation keeps the checkout clean
+        run: |
+          ./bin/fiveg capabilities --json >/tmp/fiveg-capabilities.json
+          test -z "$(git status --porcelain)"
       - name: Validate declarative example and generate Ansible inputs
         run: |
           python tools/fiveg_machine.py plan --spec examples/deployment-machine.yaml --state-root /tmp/fiveg-state --json >/tmp/plan.json
